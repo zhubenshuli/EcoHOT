@@ -1,4 +1,4 @@
-import { decodeHTMLStrict } from "entities/decode";
+import { decodeHTMLStrict } from "entities";
 
 export function collapseWhitespace(s: string): string {
   return s.replace(/\s+/g, " ").trim();

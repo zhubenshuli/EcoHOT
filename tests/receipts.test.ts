@@ -7,7 +7,7 @@ import { after, test } from "node:test";
 import { z } from "zod";
 import { config } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
-import { chatJson } from "@aihot/backend/providers/llm";
+import { chatJson, getLlmIntervalMs, throttleService } from "@aihot/backend/providers/llm";
 import { embeddingsAvailable } from "@aihot/backend/providers/embeddings";
 import { assertAccepted, failureKind, ProviderRejectedError, BudgetExceededError, logicalKeyFor, markStalePendingReceipts, ModelOutputError, paidRequest, providerStopKey, ReceiptUnknownError } from "@aihot/backend/providers/receipts";
 import { autoReleaseUnknownReceipts } from "@aihot/backend/operations/recover";
@@ -416,4 +416,23 @@ test("one model's spent quota stops that model, not the service's other models",
     await sql`DELETE FROM receipts WHERE service = 'dashscope' AND model IN (${vision}, ${text})`;
     await sql`DELETE FROM settings WHERE key = ${providerStopKey("dashscope", vision)}`;
   }
+});
+
+test("llm rpm rate limiting and serial throttle queuing", async () => {
+  delete process.env.LLM_RPM;
+  assert.equal(getLlmIntervalMs(), 12_000); // 默认 12 秒 (RPM = 5)
+  process.env.LLM_RPM = "60";
+  assert.equal(getLlmIntervalMs(), 1000); // 60 RPM -> 1000ms
+  process.env.LLM_RPM = "0";
+  assert.equal(getLlmIntervalMs(), 0);
+  delete process.env.LLM_RPM;
+
+  const key = `test-throttle-${tag()}`;
+  const start = Date.now();
+  await throttleService(key, 80);
+  const first = Date.now() - start;
+  await throttleService(key, 80);
+  const second = Date.now() - start;
+  assert.ok(first < 50, "first request proceeds immediately");
+  assert.ok(second >= 75, "second request is throttled by min interval");
 });

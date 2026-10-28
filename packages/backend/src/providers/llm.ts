@@ -121,8 +121,8 @@ function requestFor<S extends z.ZodType>(opts: ChatJsonOptions<S>, spec: ModelSp
   const userText = typeof opts.user === "string" ? opts.user : JSON.stringify(opts.user);
   const request: ReceiptRequest = {
     service: spec.service, model: spec.model, purpose: opts.purpose, subject: opts.subject,
-    identity: { model: spec.model, promptVersion: opts.promptVersion, system: sha256(opts.system), user: sha256(userText), temperature, maxTokens, extra: spec.extra ?? null },
-    requestSummary: { promptVersion: opts.promptVersion, systemHash: sha256(opts.system), userHash: sha256(userText), userChars: userText.length, temperature, maxTokens },
+    identity: { model: spec.model, promptVersion: opts.promptVersion, system: sha256(opts.system || ""), user: sha256(userText), temperature, maxTokens, extra: spec.extra ?? null },
+    requestSummary: { promptVersion: opts.promptVersion, systemHash: sha256(opts.system || ""), userHash: sha256(userText), userChars: userText.length, temperature, maxTokens },
     attemptTag: opts.attemptTag,
   };
   return { request, temperature, maxTokens, userText };
@@ -160,13 +160,74 @@ export async function chatJson<S extends z.ZodType>(opts: ChatJsonOptions<S>): P
   }
 }
 
+/**
+ * 根据环境变量配置的 RPM（每分钟请求数）计算最小请求间隔毫秒数。
+ * 默认 RPM = 5（即每 12 秒最多 1 次，12,000 毫秒）。
+ * 若配置 LLM_RPM=0，则不设固定最小间隔（但仍执行单任务串行排队）。
+ */
+export function getLlmIntervalMs(): number {
+  const rpmStr = process.env.LLM_RPM;
+  if (rpmStr !== undefined && rpmStr !== "") {
+    const rpm = Number(rpmStr);
+    if (Number.isNaN(rpm) || rpm <= 0) return 0;
+    return Math.round(60_000 / rpm);
+  }
+  return 12_000; // 默认每 12 秒最多 1 次 (RPM = 5)
+}
+
+interface ThrottleState {
+  lastRequestTime: number;
+  chain: Promise<void>;
+}
+
+const serviceThrottleQueues = new Map<string, ThrottleState>();
+
+/**
+ * 服务端请求频率限制与单任务串行排队：
+ * 保证同一时刻全局/服务只有一个请求在发起和执行，且两次请求发起间隔至少满足 minIntervalMs。
+ */
+export function throttleService(serviceKey: string, minIntervalMs: number): Promise<void> {
+  let state = serviceThrottleQueues.get(serviceKey);
+  if (!state) {
+    state = { lastRequestTime: 0, chain: Promise.resolve() };
+    serviceThrottleQueues.set(serviceKey, state);
+  }
+
+  const currentWait = state.chain.then(async () => {
+    if (minIntervalMs > 0) {
+      const now = Date.now();
+      const elapsed = now - state!.lastRequestTime;
+      if (elapsed < minIntervalMs) {
+        await new Promise((resolve) => setTimeout(resolve, minIntervalMs - elapsed));
+      }
+    }
+    state!.lastRequestTime = Date.now();
+  });
+
+  state.chain = currentWait.catch(() => {});
+  return currentWait;
+}
+
+function recordThrottleBackoff(serviceKey: string) {
+  const state = serviceThrottleQueues.get(serviceKey);
+  if (state) {
+    state.lastRequestTime = Date.now();
+  }
+}
+
 async function chatOnce<S extends z.ZodType>(opts: ChatJsonOptions<S>, circuit = false, fallbackFor?: string): Promise<ChatJsonResult<z.infer<S>>> {
   const spec = MODELS[opts.model];
   if (!spec) throw new Error(`Unknown model ${opts.model}`);
   if (!config.modelCallsEnabled) throw new ModelUnavailableError("Model calls are disabled (MODEL_CALLS_ENABLED=false)");
+
   const baseUrl = credential("models", spec.baseUrlEnv);
   const apiKey = credential("models", spec.apiKeyEnv);
-  if (!baseUrl || !apiKey || !spec.model) throw new ModelUnavailableError(`Model ${opts.model} is not configured (${spec.baseUrlEnv}, ${spec.apiKeyEnv}${spec.key === "default" ? ", LLM_MODEL" : ""})`);
+  if (!baseUrl || !apiKey || !spec.model) {
+    throw new ModelUnavailableError(`Model ${opts.model} is not configured (${spec.baseUrlEnv}, ${spec.apiKeyEnv}${spec.key === "default" ? ", LLM_MODEL" : ""})`);
+  }
+
+  const throttleKey = spec.service || "llm";
+  const throttleIntervalMs = getLlmIntervalMs();
 
   const { request, temperature, maxTokens, userText } = requestFor(opts, spec);
   const timeoutMs = opts.timeoutMs ?? (circuit ? FAILOVER_TIMEOUT_MS : TIMEOUT_MS);
@@ -191,20 +252,37 @@ async function chatOnce<S extends z.ZodType>(opts: ChatJsonOptions<S>, circuit =
       const started = performance.now();
       let res: Response;
       let text: string;
-      try {
-        res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-          method: "POST",
-          headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-          body: JSON.stringify(body),
-          signal: AbortSignal.timeout(timeoutMs),
-        });
-        text = await res.text();
-        assertAccepted(spec.service, res.status, text);
-      } catch (error) {
-        const failure = isConnectFailure(error) ? new ProviderRejectedError(`connect failed: ${String(error)}`, null, true) : error;
-        // A refusal is the provider answering; any other failure counts against its availability.
-        if (circuit) await recordModelHealth(spec.service, permit!, failureKind(failure) !== "refused");
-        throw failure;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          await throttleService(throttleKey, throttleIntervalMs);
+          res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(timeoutMs),
+          });
+          text = await res.text();
+          if (res.status === 429 && attempt < 3) {
+            recordThrottleBackoff(throttleKey);
+            const retryAfterMs = Number(res.headers.get("retry-after") || 0) * 1000;
+            const backoffMs = Math.max(retryAfterMs, throttleIntervalMs > 0 ? throttleIntervalMs * (attempt + 1) : 2500 * (attempt + 1));
+            await new Promise((r) => setTimeout(r, backoffMs));
+            continue;
+          }
+          assertAccepted(spec.service, res.status, text);
+          break;
+        } catch (error) {
+          if (attempt < 3 && error instanceof ProviderRejectedError && error.status === 429) {
+            recordThrottleBackoff(throttleKey);
+            const backoffMs = throttleIntervalMs > 0 ? throttleIntervalMs * (attempt + 1) : 2500 * (attempt + 1);
+            await new Promise((r) => setTimeout(r, backoffMs));
+            continue;
+          }
+          const failure = isConnectFailure(error) ? new ProviderRejectedError(`connect failed: ${String(error)}`, null, true) : error;
+          // A refusal is the provider answering; any other failure counts against its availability.
+          if (circuit) await recordModelHealth(spec.service, permit!, failureKind(failure) !== "refused");
+          throw failure;
+        }
       }
       if (circuit) await recordModelHealth(spec.service, permit!, false);
       let json: Record<string, unknown>;

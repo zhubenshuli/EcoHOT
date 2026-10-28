@@ -440,6 +440,7 @@ export async function extractFromUrl(url: string, subject: string, rules: PageRu
     return { html, text, images: [], via: "jina" };
   } catch (error) {
     if (error instanceof BudgetExceededError || error instanceof UnavailablePageError) return null;
+    if (error instanceof Error && error.message.includes("JINA_API_KEY is not configured")) return null;
     throw error;
   }
 }
