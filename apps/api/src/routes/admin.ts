@@ -7,7 +7,7 @@ import { actorOf } from "@aihot/backend/admin/auth";
 import { navCounts } from "@aihot/backend/admin/navigation";
 import { listAudit } from "@aihot/backend/audit";
 import { importSelectBenchRun, listSelectBenchRuns, selectBenchRun } from "@aihot/backend/admin/selectbench";
-import { modelsOverview, switchModel } from "@aihot/backend/admin/models";
+import { channelsOverview, modelsOverview, resetChannelAdminState, switchModel } from "@aihot/backend/admin/models";
 import { contentChain, overrideFields, rerun, searchContent, setSeoIndexed, setVisibility } from "@aihot/backend/admin/content";
 import { detachFromFact, mergeStories } from "@aihot/backend/events/corrections";
 import { banFeedbackEmail, banSource, eraseFeedback, feedbackScreenshot, listFeedback, unbanSource, updateFeedback } from "@aihot/backend/admin/feedback";
@@ -113,6 +113,17 @@ export function registerAdmin(app: FastifyInstance) {
   app.post("/api/admin/models/:capability", adminHandler(async (req, _reply, admin) => {
     const b = body<{ model: string | null; reason: string }>(req);
     return switchModel(param(req, "capability"), b.model ?? null, String(b.reason ?? ""), actorOf(admin));
+  }));
+
+  // Model channels pool
+  app.get("/api/admin/channels", adminHandler(async (req) => {
+    const raw = q(req).days;
+    const days = raw === undefined || raw === "" ? 0 : Math.min(90, Math.max(0, Number(raw) || 0));
+    return channelsOverview(days);
+  }));
+  app.post("/api/admin/channels/:id/reset", adminHandler(async (req, _reply, admin) => {
+    const b = body<{ reason?: string }>(req);
+    return resetChannelAdminState(param(req, "id"), String(b.reason ?? "后台手动重置通道状态"), actorOf(admin));
   }));
 
   // SelectBench

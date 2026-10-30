@@ -188,32 +188,6 @@
       "syndicate_fulltext": false
     },
     {
-      "id": "json-sina-roll-finance",
-      "name": "新浪财经 - 市场与商品资讯",
-      "kind": "json_list",
-      "config": {
-        "url": "https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k=&num=30&page=1",
-        "itemsPath": "result.data",
-        "titlePaths": ["title"],
-        "urlTemplate": "{raw:url}",
-        "publishedAtPath": "ctime",
-        "publishedAtUnit": "epoch_s",
-        "summaryPaths": ["intro"]
-      },
-      "tier": "T2",
-      "participation_mode": "editorial",
-      "interval_minutes": 30,
-      "tags": [
-        "市场",
-        "大宗商品",
-        "黄金",
-        "石油",
-        "基础资源"
-      ],
-      "site_fulltext": false,
-      "syndicate_fulltext": false
-    },
-    {
       "id": "rss-oilprice-main",
       "name": "OilPrice - 国际原油与能源",
       "kind": "rss",

@@ -399,3 +399,88 @@ export interface AdminSelectBenchCases {
   rows: Array<{ case_id: string; title: string; stratum: string | null; gold: "select" | "reject" | "either"; by_model: Record<string, AdminSelectBenchDecision> }>;
   strata: Array<{ stratum: string | null; n: number }>;
 }
+
+// Model channels pool
+
+export interface AdminChannelPurposeUsage {
+  purpose: string;
+  calls: number;
+  ok: number;
+  failed: number;
+  p50: number | null;
+  p95: number | null;
+  tokensIn: number;
+  tokensOut: number;
+  lastAt: Timestamp | null;
+}
+
+export interface AdminChannelFailureRecord {
+  at: Timestamp;
+  error: string;
+  receiptId?: number | null;
+  purpose?: string | null;
+}
+
+export interface AdminChannelItem {
+  id: string;
+  index: number;
+  host: string;
+  baseUrl: string;
+  model: string;
+  quotaMode: string;
+  status: "active" | "standby" | "cooldown" | "exhausted";
+  available: boolean;
+  consecutiveFailures: number;
+  failureLimit: number;
+  cooldownUntil: Timestamp | null;
+  exhaustedUntil: Timestamp | null;
+  lastSuccessAt: Timestamp | null;
+  lastErrorAt: Timestamp | null;
+  lastError: string | null;
+  recentFailures: AdminChannelFailureRecord[];
+  quotaInfo: {
+    usedPct: number | null;
+    remainingTokens: number | null;
+    limitTokens: number | null;
+    resetsAt: Timestamp | null;
+    updatedAt: Timestamp | null;
+  } | null;
+  totals: {
+    calls: number;
+    ok: number;
+    failed: number;
+    failoverFrom: number;
+    p50: number | null;
+    p95: number | null;
+    tokensIn: number;
+    tokensOut: number;
+  };
+  usage: AdminChannelPurposeUsage[];
+}
+
+export interface AdminChannelRecentCall {
+  id: number;
+  channelId: string | null;
+  channelIndex: number | null;
+  model: string | null;
+  purpose: string;
+  subject: string | null;
+  status: string;
+  latencyMs: number | null;
+  tokensIn: number;
+  tokensOut: number;
+  attemptedChannels: string[];
+  failoverErrors: Array<{ channelId: string; error: string }>;
+  error: string | null;
+  at: Timestamp;
+}
+
+export interface AdminChannels {
+  days: number;
+  rpm: number;
+  intervalMs: number;
+  tokenThreshold: number;
+  activeChannelId: string | null;
+  channels: AdminChannelItem[];
+  recentCalls: AdminChannelRecentCall[];
+}

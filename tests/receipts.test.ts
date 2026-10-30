@@ -1,13 +1,25 @@
 // Paid requests: an answer already received is reused, every request actually sent counts against the
 // budget (retries of one logical request included), a lost answer is bought again at most once, an
 // answer cut off at the output limit says so, and the valve stops calls before they are sent.
-import { gate, stub, tag } from "./setup.ts";
+import { gate, Reply, stub, tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { z } from "zod";
 import { config } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
-import { chatJson, getLlmIntervalMs, throttleService } from "@aihot/backend/providers/llm";
+import {
+  CHANNEL_COOLDOWN_MS,
+  CHANNEL_STATE_SETTING_KEY,
+  chatJson,
+  getChannelState,
+  getLlmIntervalMs,
+  getNextUtcResetMs,
+  isChannelAvailable,
+  recordChannelSuccess,
+  resetChannelStates,
+  syncChannelStatesFromDb,
+  throttleService,
+} from "@aihot/backend/providers/llm";
 import { embeddingsAvailable } from "@aihot/backend/providers/embeddings";
 import { assertAccepted, failureKind, ProviderRejectedError, BudgetExceededError, logicalKeyFor, markStalePendingReceipts, ModelOutputError, paidRequest, providerStopKey, ReceiptUnknownError } from "@aihot/backend/providers/receipts";
 import { autoReleaseUnknownReceipts } from "@aihot/backend/operations/recover";
@@ -435,4 +447,188 @@ test("llm rpm rate limiting and serial throttle queuing", async () => {
   const second = Date.now() - start;
   assert.ok(first < 50, "first request proceeds immediately");
   assert.ok(second >= 75, "second request is throttled by min interval");
+});
+
+test("multi-channel llm: per-channel quota exhaustion, transient failover, and 3-failure 1h cooldown", async () => {
+  const now = Date.UTC(2026, 9, 28, 10, 30, 0);
+  assert.equal(getNextUtcResetMs(now), Date.UTC(2026, 9, 29, 1, 0, 0));
+  const afterMidnightBefore1Am = Date.UTC(2026, 9, 29, 0, 30, 0);
+  assert.equal(getNextUtcResetMs(afterMidnightBefore1Am), Date.UTC(2026, 9, 29, 1, 0, 0));
+
+  let ch1Behavior: "ok" | "transient" | "quota" = "transient";
+  let ch2QuotaRemaining = 100_000;
+  let ch1Calls = 0;
+  let ch2Calls = 0;
+  let ch2SubChecks = 0;
+  let ch3Calls = 0;
+  const usedModels: string[] = [];
+
+  // Channel 1: NVIDIA style (http-status quota detection)
+  const ch1Server = await stub((hit, req) => {
+    ch1Calls++;
+    const model = (JSON.parse(req.body) as { model: string }).model;
+    if (ch1Behavior === "ok") {
+      usedModels.push(model);
+      return { id: `ch1-${hit}`, choices: [{ message: { content: '{"ok":true}' } }], usage };
+    }
+    if (ch1Behavior === "quota") {
+      return new Reply(402, { error: { message: "Account out of credits" } });
+    }
+    return new Reply(504, { error: { message: "Gateway timeout" } });
+  });
+
+  // Channel 2: Apinex style (/subscription quota detection)
+  const ch2Server = await stub((hit, req) => {
+    if (req.url === "/v1/subscription") {
+      ch2SubChecks++;
+      return {
+        object: "subscription",
+        unlimited: false,
+        tokens_remaining: ch2QuotaRemaining,
+        resets_at_utc: "2026-10-30T00:00:00.000Z",
+        allowed: ch2QuotaRemaining > 0,
+      };
+    }
+    ch2Calls++;
+    const model = (JSON.parse(req.body) as { model: string }).model;
+    if (ch2QuotaRemaining <= 50_000) {
+      return new Reply(429, { error: { message: "quota exceeded" } });
+    }
+    usedModels.push(model);
+    return { id: `ch2-${hit}`, choices: [{ message: { content: '{"ok":true}' } }], usage };
+  });
+
+  // Channel 3: TokenHarbor style (response header quota detection)
+  const ch3Server = await stub((hit, req) => {
+    ch3Calls++;
+    const model = (JSON.parse(req.body) as { model: string }).model;
+    usedModels.push(model);
+    return new Reply(
+      200,
+      { id: `ch3-${hit}`, choices: [{ message: { content: '{"ok":true}' } }], usage },
+      { "x-th-free-used-pct": "100", "x-th-free-resets": "2026-11-04T10:00:00.000Z" },
+    );
+  });
+
+  const envKeys = [
+    "LLM_BASE_URL",
+    "LLM_API_KEY",
+    "LLM_MODEL",
+    "LLM_CHANNEL_1_QUOTA_MODE",
+    "LLM_CHANNEL_2_BASE_URL",
+    "LLM_CHANNEL_2_API_KEY",
+    "LLM_CHANNEL_2_MODEL",
+    "LLM_CHANNEL_2_QUOTA_MODE",
+    "LLM_CHANNEL_3_BASE_URL",
+    "LLM_CHANNEL_3_API_KEY",
+    "LLM_CHANNEL_3_MODEL",
+    "LLM_CHANNEL_3_QUOTA_MODE",
+    "LLM_TOKEN_THRESHOLD",
+    "LLM_RPM",
+  ] as const;
+  const prevEnv: Record<string, string | undefined> = {};
+  for (const k of envKeys) prevEnv[k] = process.env[k];
+
+  const callDefault = (label: string) =>
+    chatJson({
+      model: "default",
+      purpose: "invariant_test",
+      subject: `mc-${label}-${tag()}`,
+      promptVersion: "t1",
+      system: "s",
+      user: label,
+      schema: z.object({ ok: z.boolean() }),
+    });
+
+  try {
+    resetChannelStates();
+    Object.assign(process.env, {
+      LLM_BASE_URL: `${ch1Server.url}/v1`,
+      LLM_API_KEY: "ch1-key",
+      LLM_MODEL: "minimaxai/minimax-m3.1-flash",
+      LLM_CHANNEL_1_QUOTA_MODE: "nvidia",
+      LLM_CHANNEL_2_BASE_URL: `${ch2Server.url}/v1`,
+      LLM_CHANNEL_2_API_KEY: "ch2-key",
+      LLM_CHANNEL_2_MODEL: "free/deepseek-v4.1-flash",
+      LLM_CHANNEL_2_QUOTA_MODE: "apinex",
+      LLM_CHANNEL_3_BASE_URL: `${ch3Server.url}/v1`,
+      LLM_CHANNEL_3_API_KEY: "ch3-key",
+      LLM_CHANNEL_3_MODEL: "deepseek-v4.1-flash:free",
+      LLM_CHANNEL_3_QUOTA_MODE: "tokenharbor",
+      LLM_TOKEN_THRESHOLD: "50000",
+      LLM_RPM: "0",
+    });
+
+    // 1. First transient error on ch-1 -> temporarily uses ch-2, next request returns to ch-1
+    ch1Behavior = "transient";
+    await callDefault("req1");
+    assert.equal(ch1Calls, 1, "req1 tried ch-1 first");
+    assert.equal(ch2Calls, 1, "req1 failed over to ch-2");
+    assert.equal(getChannelState("ch-1").consecutiveFailures, 1);
+    assert.equal(isChannelAvailable("ch-1"), true, "ch-1 not in cooldown after 1 failure");
+
+    // 2. Next request returns to ch-1; when ch-1 succeeds, failure count resets to 0
+    ch1Behavior = "ok";
+    await callDefault("req2");
+    assert.equal(ch1Calls, 2, "req2 returned to ch-1");
+    assert.equal(ch2Calls, 1, "ch-2 was not needed");
+    assert.equal(getChannelState("ch-1").consecutiveFailures, 0, "ch-1 failure count reset on success");
+
+    // 3. Three consecutive failures on ch-1 -> triggers 1h cooldown on ch-1
+    ch1Behavior = "transient";
+    await callDefault("req3-fail1");
+    assert.equal(getChannelState("ch-1").consecutiveFailures, 1);
+    await callDefault("req4-fail2");
+    assert.equal(getChannelState("ch-1").consecutiveFailures, 2);
+    assert.equal(isChannelAvailable("ch-1"), true, "still available after 2 failures");
+
+    const before3rdFail = Date.now();
+    await callDefault("req5-fail3");
+    assert.equal(ch1Calls, 5, "tried ch-1 3 consecutive times");
+    assert.equal(getChannelState("ch-1").consecutiveFailures, 3, "counter stays at failure limit during cooldown");
+    assert.ok(getChannelState("ch-1").cooldownUntil >= before3rdFail + CHANNEL_COOLDOWN_MS - 1000, "1h cooldown set");
+    assert.equal(isChannelAvailable("ch-1"), false, "ch-1 is now in cooldown");
+
+    // 4. Subsequent request skips ch-1 during cooldown and goes directly to ch-2
+    await callDefault("req6-during-cooldown");
+    assert.equal(ch1Calls, 5, "ch-1 was skipped while cooling down");
+    assert.equal(ch2Calls, 5, "went straight to ch-2");
+    assert.equal(isChannelAvailable("ch-1", before3rdFail + CHANNEL_COOLDOWN_MS + 2000), true);
+    assert.equal(getChannelState("ch-1").consecutiveFailures, 0, "counter resets once cooldown expires");
+
+    // 5. Quota exhaustion cascade: reset states, ch-1 quota exhausted -> ch-2 quota exhausted -> ch-3
+    resetChannelStates();
+    ch1Behavior = "quota";
+    ch2QuotaRemaining = 5000; // <= 50,000 threshold
+    await callDefault("req7-cascade");
+    assert.equal(ch1Calls, 6, "tried ch-1 and hit 402 quota error");
+    assert.equal(isChannelAvailable("ch-1"), false, "ch-1 marked exhausted");
+    assert.equal(ch2Calls, 6, "tried ch-2 and hit 429");
+    assert.equal(ch2SubChecks, 1, "ch-2 checked /v1/subscription");
+    assert.equal(isChannelAvailable("ch-2"), false, "ch-2 marked exhausted via subscription");
+    assert.equal(ch3Calls, 1, "cascaded to ch-3");
+    // ch-3 returned x-th-free-used-pct: 100, so it also proactively marks itself exhausted until x-th-free-resets
+    assert.equal(getChannelState("ch-3").exhaustedUntil, Date.parse("2026-11-04T10:00:00.000Z"));
+
+    // 6. Cross-process DB sync: an older in-memory state in API is updated when worker writes newer lastSuccessAt to DB
+    resetChannelStates();
+    const olderMs = Date.parse("2026-10-29T03:00:00.000Z");
+    const newerIso = "2026-10-29T05:40:00.000Z";
+    recordChannelSuccess("ch-1", olderMs);
+    assert.equal(getChannelState("ch-1").lastSuccessAt, "2026-10-29T03:00:00.000Z");
+    await sql`INSERT INTO settings (key, value, updated_by)
+              VALUES (${CHANNEL_STATE_SETTING_KEY}, ${sql.json({ "ch-1": { consecutiveFailures: 0, cooldownUntil: 0, exhaustedUntil: 0, lastSuccessAt: newerIso } } as never)}, 'llm-pool')
+              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`;
+    await syncChannelStatesFromDb();
+    assert.equal(getChannelState("ch-1").lastSuccessAt, newerIso, "newer worker lastSuccessAt replaces stale local cache");
+  } finally {
+    resetChannelStates();
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    await ch1Server.close();
+    await ch2Server.close();
+    await ch3Server.close();
+  }
 });

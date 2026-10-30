@@ -6,6 +6,7 @@ import type { z } from "zod";
 import type { ModelPreset } from "@aihot/contracts/site-config";
 import { PRESETS } from "@aihot/site/models";
 import { config, credential } from "../config.ts";
+import { sql } from "../db.ts";
 import { sha256 } from "../lib/ids.ts";
 import {
   assertAccepted, failureKind, logicalKeyFor, ModelOutputError, ModelUnavailableError, paidRequest, ProviderRejectedError, receiptState, rejectReceivedResponse,
@@ -215,14 +216,365 @@ function recordThrottleBackoff(serviceKey: string) {
   }
 }
 
+export const CHANNEL_FAILURE_LIMIT = 3;
+export const CHANNEL_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+
+export type QuotaMode = "nvidia" | "apinex" | "tokenharbor" | "http-status" | "subscription";
+
+export interface LlmChannelConfig {
+  index: number;
+  id: string;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  quotaMode: QuotaMode;
+  extra?: Record<string, unknown>;
+}
+
+export interface LlmChannelQuotaInfo {
+  usedPct?: number | null;
+  remainingTokens?: number | null;
+  limitTokens?: number | null;
+  resetsAt?: string | null;
+  updatedAt?: string | null;
+}
+
+export interface LlmChannelState {
+  consecutiveFailures: number;
+  cooldownUntil: number;
+  exhaustedUntil: number;
+  lastSuccessAt?: string | null;
+  lastErrorAt?: string | null;
+  lastError?: string | null;
+  recentFailures?: Array<{ at: string; error: string }>;
+  quotaInfo?: LlmChannelQuotaInfo | null;
+  resetAt?: number;
+  updatedAtMs?: number;
+}
+
+export const CHANNEL_STATE_SETTING_KEY = "llm.channels.state";
+
+const channelStates = new Map<string, LlmChannelState>();
+
+function shouldPersistState(): boolean {
+  return process.env.AIHOT_CREDENTIALS_DIR !== "/nonexistent-test-credentials";
+}
+
+function stateTimestampMs(s?: Partial<LlmChannelState> | null): number {
+  if (!s) return 0;
+  const lastSuccess = s.lastSuccessAt ? Date.parse(s.lastSuccessAt) || 0 : 0;
+  const lastError = s.lastErrorAt ? Date.parse(s.lastErrorAt) || 0 : 0;
+  const quotaUpdated = s.quotaInfo?.updatedAt ? Date.parse(s.quotaInfo.updatedAt) || 0 : 0;
+  return Math.max(s.updatedAtMs ?? 0, s.resetAt ?? 0, lastSuccess, lastError, quotaUpdated);
+}
+
+function schedulePersistChannelState(channelId: string): void {
+  if (!shouldPersistState()) return;
+  const current = channelStates.get(channelId);
+  if (!current) return;
+  const patch: Record<string, LlmChannelState> = { [channelId]: { ...current } };
+  sql`INSERT INTO settings (key, value, updated_by)
+      VALUES (${CHANNEL_STATE_SETTING_KEY}, ${sql.json(patch as never)}, 'llm-pool')
+      ON CONFLICT (key) DO UPDATE
+      SET value = coalesce(settings.value, '{}'::jsonb) || EXCLUDED.value,
+          updated_by = EXCLUDED.updated_by,
+          updated_at = now()`
+    .catch(() => {});
+}
+
+export async function syncChannelStatesFromDb(options?: { force?: boolean }): Promise<Record<string, LlmChannelState>> {
+  try {
+    const [row] = await sql<{ value: Record<string, LlmChannelState> }[]>`
+      SELECT value FROM settings WHERE key = ${CHANNEL_STATE_SETTING_KEY}`;
+    const saved = row?.value && typeof row.value === "object" ? row.value : {};
+    if (options?.force) {
+      channelStates.clear();
+    }
+    for (const [id, remote] of Object.entries(saved)) {
+      if (!remote || typeof remote !== "object") continue;
+      const local = channelStates.get(id);
+      if (options?.force || !local || stateTimestampMs(remote) >= stateTimestampMs(local)) {
+        channelStates.set(id, {
+          consecutiveFailures: Number(remote.consecutiveFailures ?? 0),
+          cooldownUntil: Number(remote.cooldownUntil ?? 0),
+          exhaustedUntil: Number(remote.exhaustedUntil ?? 0),
+          lastSuccessAt: remote.lastSuccessAt ?? local?.lastSuccessAt ?? null,
+          lastErrorAt: remote.lastErrorAt ?? null,
+          lastError: remote.lastError ?? null,
+          recentFailures: remote.recentFailures ?? local?.recentFailures ?? [],
+          quotaInfo: remote.quotaInfo ?? local?.quotaInfo ?? null,
+          resetAt: remote.resetAt ?? 0,
+          updatedAtMs: stateTimestampMs(remote),
+        });
+      }
+    }
+    return saved;
+  } catch {
+    return {};
+  }
+}
+
+export function getChannelState(channelId: string): LlmChannelState {
+  let state = channelStates.get(channelId);
+  if (!state) {
+    state = { consecutiveFailures: 0, cooldownUntil: 0, exhaustedUntil: 0 };
+    channelStates.set(channelId, state);
+  }
+  return state;
+}
+
+export function isChannelAvailable(channelId: string, nowMs = Date.now()): boolean {
+  const state = getChannelState(channelId);
+  if (state.cooldownUntil > 0 && nowMs >= state.cooldownUntil) {
+    state.cooldownUntil = 0;
+    state.consecutiveFailures = 0;
+  }
+  return nowMs >= state.exhaustedUntil && nowMs >= state.cooldownUntil;
+}
+
+export function resetChannelStates(): void {
+  channelStates.clear();
+}
+
+export function recordChannelSuccess(channelId: string, nowMs = Date.now()): void {
+  const state = getChannelState(channelId);
+  state.consecutiveFailures = 0;
+  state.cooldownUntil = 0;
+  state.lastSuccessAt = new Date(nowMs).toISOString();
+  state.updatedAtMs = nowMs;
+  schedulePersistChannelState(channelId);
+}
+
+export function recordChannelFailure(channelId: string, nowMs = Date.now(), errorMsg?: string): LlmChannelState {
+  const state = getChannelState(channelId);
+  state.lastErrorAt = new Date(nowMs).toISOString();
+  if (errorMsg) {
+    state.lastError = errorMsg.slice(0, 300);
+    state.recentFailures ??= [];
+    state.recentFailures.unshift({ at: new Date(nowMs).toISOString(), error: errorMsg.slice(0, 300) });
+    if (state.recentFailures.length > 20) state.recentFailures.length = 20;
+  }
+  if (nowMs < state.cooldownUntil) {
+    state.consecutiveFailures = CHANNEL_FAILURE_LIMIT;
+    state.updatedAtMs = nowMs;
+    schedulePersistChannelState(channelId);
+    return state;
+  }
+  state.consecutiveFailures += 1;
+  if (state.consecutiveFailures >= CHANNEL_FAILURE_LIMIT) {
+    state.cooldownUntil = nowMs + CHANNEL_COOLDOWN_MS;
+    state.consecutiveFailures = CHANNEL_FAILURE_LIMIT;
+  }
+  state.updatedAtMs = nowMs;
+  schedulePersistChannelState(channelId);
+  return state;
+}
+
+export function markChannelExhausted(channelId: string, untilMs: number, errorMsg?: string, nowMs = Date.now()): LlmChannelState {
+  const state = getChannelState(channelId);
+  state.exhaustedUntil = untilMs;
+  state.consecutiveFailures = 0;
+  if (errorMsg) {
+    state.lastErrorAt = new Date(nowMs).toISOString();
+    state.lastError = errorMsg.slice(0, 300);
+    state.recentFailures ??= [];
+    state.recentFailures.unshift({ at: new Date(nowMs).toISOString(), error: errorMsg.slice(0, 300) });
+    if (state.recentFailures.length > 20) state.recentFailures.length = 20;
+  }
+  state.updatedAtMs = nowMs;
+  schedulePersistChannelState(channelId);
+  return state;
+}
+
+export function updateChannelQuotaInfo(channelId: string, info: LlmChannelQuotaInfo, nowMs = Date.now()): void {
+  const state = getChannelState(channelId);
+  state.quotaInfo = { ...state.quotaInfo, ...info, updatedAt: new Date(nowMs).toISOString() };
+  state.updatedAtMs = nowMs;
+  schedulePersistChannelState(channelId);
+}
+
+export function getNextUtcResetMs(nowMs = Date.now()): number {
+  const d = new Date(nowMs);
+  const nextDayOffset = d.getUTCHours() < 1 ? 0 : 1;
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + nextDayOffset, 1, 0, 0, 0);
+}
+
+export function getTokenThreshold(): number {
+  const val = process.env.LLM_TOKEN_THRESHOLD;
+  if (val !== undefined && val !== "") {
+    const num = Number(val);
+    if (Number.isFinite(num) && num >= 0) return num;
+  }
+  return 50_000;
+}
+
+export function detectQuotaMode(baseUrl: string, explicitMode?: string | null): QuotaMode {
+  const normalized = explicitMode?.trim().toLowerCase();
+  if (
+    normalized === "nvidia" ||
+    normalized === "apinex" ||
+    normalized === "tokenharbor" ||
+    normalized === "http-status" ||
+    normalized === "subscription"
+  ) {
+    return normalized;
+  }
+  const lowerUrl = baseUrl.toLowerCase();
+  if (lowerUrl.includes("apinex.bond")) return "apinex";
+  if (lowerUrl.includes("tokenharbor.ai")) return "tokenharbor";
+  if (lowerUrl.includes("nvidia.com")) return "nvidia";
+  return "http-status";
+}
+
+export function getLlmChannels(spec: ModelSpec): LlmChannelConfig[] {
+  const primaryBaseUrl = credential("models", spec.baseUrlEnv);
+  const primaryApiKey = credential("models", spec.apiKeyEnv);
+  if (!primaryBaseUrl || !primaryApiKey || !spec.model) return [];
+
+  const channels: LlmChannelConfig[] = [
+    {
+      index: 1,
+      id: "ch-1",
+      baseUrl: primaryBaseUrl,
+      apiKey: primaryApiKey,
+      model: spec.model,
+      quotaMode: detectQuotaMode(
+        primaryBaseUrl,
+        spec.key === "default" ? (process.env.LLM_CHANNEL_1_QUOTA_MODE ?? process.env.LLM_QUOTA_MODE) : undefined,
+      ),
+      extra: spec.extra,
+    },
+  ];
+
+  if (spec.key !== "default") return channels;
+
+  for (let i = 2; i <= 20; i++) {
+    const baseUrl = credential("models", `LLM_CHANNEL_${i}_BASE_URL`);
+    const apiKey = credential("models", `LLM_CHANNEL_${i}_API_KEY`);
+    if (!baseUrl || !apiKey) continue;
+    const model = process.env[`LLM_CHANNEL_${i}_MODEL`]?.trim() || spec.model;
+    const quotaMode = detectQuotaMode(baseUrl, process.env[`LLM_CHANNEL_${i}_QUOTA_MODE`]);
+    const extraRaw = process.env[`LLM_CHANNEL_${i}_EXTRA_JSON`];
+    const extra = extraRaw !== undefined ? extraFromEnv(extraRaw) : spec.extra;
+    channels.push({
+      index: i,
+      id: `ch-${i}`,
+      baseUrl,
+      apiKey,
+      model,
+      quotaMode,
+      extra,
+    });
+  }
+
+  return channels;
+}
+
+export type QuotaCheckResult = { exhausted: false } | { exhausted: true; untilMs: number };
+
+const HTTP_QUOTA_EXHAUSTED_RE =
+  /\binsufficient_quota\b|\bcredit_balance_exhausted\b|\bsponsored_pool_exhausted\b|\bpool has been used up\b|\bFreeUsageLimitError\b|\bGoUsageLimitError\b|\bfree_usage_limit\b|\bgo_usage_limit\b|\bCreditLimitExceeded\b|\bout of credits\b|\bnot enough credits\b|\binsufficient (?:account |credit )?balance\b|\b(?:credit )?balance (?:is )?(?:exhausted|insufficient)\b|\bfree allocated quota exceeded\b|账户.*欠费|余额不足|额度耗尽/i;
+
+export async function checkChannelQuotaExhausted(
+  channel: LlmChannelConfig,
+  res: Response | null,
+  responseText: string,
+  nowMs = Date.now(),
+  timeoutMs = 10_000,
+): Promise<QuotaCheckResult> {
+  const defaultResetMs = getNextUtcResetMs(nowMs);
+
+  if (channel.quotaMode === "apinex" || channel.quotaMode === "subscription") {
+    try {
+      const subRes = await fetch(`${channel.baseUrl.replace(/\/$/, "")}/subscription`, {
+        method: "GET",
+        headers: { authorization: `Bearer ${channel.apiKey}` },
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (subRes.ok) {
+        const data = (await subRes.json()) as {
+          unlimited?: boolean;
+          token_limit?: number | null;
+          tokens_used?: number | null;
+          tokens_remaining?: number | null;
+          allowed?: boolean;
+          resets_at_utc?: string | null;
+        };
+        const limit = typeof data.token_limit === "number" ? data.token_limit : null;
+        const remaining = typeof data.tokens_remaining === "number" ? data.tokens_remaining : null;
+        const usedPct = limit && limit > 0 && remaining !== null ? Math.round(((limit - remaining) / limit) * 1000) / 10 : null;
+        updateChannelQuotaInfo(channel.id, {
+          remainingTokens: remaining,
+          limitTokens: limit,
+          usedPct,
+          resetsAt: data.resets_at_utc ?? null,
+        });
+        if (data.unlimited === true) return { exhausted: false };
+        const threshold = getTokenThreshold();
+        const exhausted =
+          data.allowed === false ||
+          (typeof data.tokens_remaining === "number" && data.tokens_remaining <= threshold);
+        if (exhausted) {
+          return { exhausted: true, untilMs: defaultResetMs };
+        }
+        return { exhausted: false };
+      }
+    } catch {
+      // ignore subscription lookup failure and fall back to status check below
+    }
+    if (res?.status === 402) return { exhausted: true, untilMs: defaultResetMs };
+    return { exhausted: false };
+  }
+
+  if (channel.quotaMode === "tokenharbor") {
+    if (!res) return { exhausted: false };
+    const usedPctHeader = res.headers.get("x-th-free-used-pct");
+    const usedPct = usedPctHeader !== null && usedPctHeader !== "" ? Number(usedPctHeader) : Number.NaN;
+    const resetHeader = res.headers.get("x-th-free-resets");
+    const parsedReset = resetHeader ? Date.parse(resetHeader) : Number.NaN;
+    const untilMs = Number.isFinite(parsedReset) && parsedReset > nowMs ? parsedReset : defaultResetMs;
+
+    if (Number.isFinite(usedPct) || resetHeader) {
+      updateChannelQuotaInfo(channel.id, {
+        usedPct: Number.isFinite(usedPct) ? usedPct : null,
+        resetsAt: Number.isFinite(parsedReset) ? new Date(parsedReset).toISOString() : null,
+      });
+    }
+
+    if (Number.isFinite(usedPct) && usedPct >= 100) {
+      return { exhausted: true, untilMs };
+    }
+    if (res.status === 402) {
+      return { exhausted: true, untilMs };
+    }
+    if (
+      res.status === 429 &&
+      (!Number.isFinite(usedPct) || usedPct >= 100) &&
+      (/allowance|free[- ]tier|rolling.*7[- ]day/i.test(responseText) || HTTP_QUOTA_EXHAUSTED_RE.test(responseText))
+    ) {
+      return { exhausted: true, untilMs };
+    }
+    return { exhausted: false };
+  }
+
+  // "nvidia" or "http-status"
+  if (!res) return { exhausted: false };
+  if (res.status === 402) {
+    return { exhausted: true, untilMs: defaultResetMs };
+  }
+  if ((res.status === 403 || res.status === 429) && HTTP_QUOTA_EXHAUSTED_RE.test(responseText)) {
+    return { exhausted: true, untilMs: defaultResetMs };
+  }
+  return { exhausted: false };
+}
+
 async function chatOnce<S extends z.ZodType>(opts: ChatJsonOptions<S>, circuit = false, fallbackFor?: string): Promise<ChatJsonResult<z.infer<S>>> {
   const spec = MODELS[opts.model];
   if (!spec) throw new Error(`Unknown model ${opts.model}`);
   if (!config.modelCallsEnabled) throw new ModelUnavailableError("Model calls are disabled (MODEL_CALLS_ENABLED=false)");
 
-  const baseUrl = credential("models", spec.baseUrlEnv);
-  const apiKey = credential("models", spec.apiKeyEnv);
-  if (!baseUrl || !apiKey || !spec.model) {
+  const channels = getLlmChannels(spec);
+  if (channels.length === 0) {
     throw new ModelUnavailableError(`Model ${opts.model} is not configured (${spec.baseUrlEnv}, ${spec.apiKeyEnv}${spec.key === "default" ? ", LLM_MODEL" : ""})`);
   }
 
@@ -232,58 +584,159 @@ async function chatOnce<S extends z.ZodType>(opts: ChatJsonOptions<S>, circuit =
   const { request, temperature, maxTokens, userText } = requestFor(opts, spec);
   const timeoutMs = opts.timeoutMs ?? (circuit ? FAILOVER_TIMEOUT_MS : TIMEOUT_MS);
   let permit: CircuitPermit;
-  const body: Record<string, unknown> = {
-    model: spec.model,
-    messages: [
-      // A prompt given as one user message (the title/summary prompts) has no system message.
-      ...(opts.system ? [{ role: "system", content: opts.system }] : []),
-      // Multimodal parts go through as parts; plain objects are sent as JSON text.
-      { role: "user", content: typeof opts.user === "string" || Array.isArray(opts.user) ? opts.user : userText },
-    ],
-    temperature,
-    max_tokens: maxTokens,
-    ...(spec.jsonMode && opts.json !== false ? { response_format: { type: "json_object" } } : {}),
-    ...(spec.extra ?? {}),
-  };
+  const baseMessages = [
+    // A prompt given as one user message (the title/summary prompts) has no system message.
+    ...(opts.system ? [{ role: "system", content: opts.system }] : []),
+    // Multimodal parts go through as parts; plain objects are sent as JSON text.
+    { role: "user", content: typeof opts.user === "string" || Array.isArray(opts.user) ? opts.user : userText },
+  ];
 
   const receipt = await paidRequest(
     { ...request, fallbackFor },
     async () => {
-      const started = performance.now();
-      let res: Response;
-      let text: string;
-      for (let attempt = 0; attempt < 4; attempt++) {
-        try {
-          await throttleService(throttleKey, throttleIntervalMs);
-          res = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
-            method: "POST",
-            headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-            body: JSON.stringify(body),
-            signal: AbortSignal.timeout(timeoutMs),
-          });
-          text = await res.text();
-          if (res.status === 429 && attempt < 3) {
-            recordThrottleBackoff(throttleKey);
-            const retryAfterMs = Number(res.headers.get("retry-after") || 0) * 1000;
-            const backoffMs = Math.max(retryAfterMs, throttleIntervalMs > 0 ? throttleIntervalMs * (attempt + 1) : 2500 * (attempt + 1));
-            await new Promise((r) => setTimeout(r, backoffMs));
+      let res!: Response;
+      let text!: string;
+      let usedChannel = channels[0]!;
+      let sentAt = new Date().toISOString();
+      let httpLatencyMs = 0;
+      const attemptedChannels: string[] = [];
+      const failoverErrors: Array<{ channelId: string; error: string }> = [];
+
+      // Single-channel mode (no extra fallback channels configured): keep standard 429 retry behavior.
+      if (channels.length === 1) {
+        const ch = channels[0]!;
+        usedChannel = ch;
+        attemptedChannels.push(ch.id);
+        const activeThrottleKey = `${throttleKey}-${ch.id}`;
+        const activeBody: Record<string, unknown> = {
+          model: ch.model,
+          messages: baseMessages,
+          temperature,
+          max_tokens: maxTokens,
+          ...(spec.jsonMode && opts.json !== false ? { response_format: { type: "json_object" } } : {}),
+          ...(ch.extra ?? {}),
+        };
+        for (let attempt = 0; attempt < 4; attempt++) {
+          try {
+            await throttleService(activeThrottleKey, throttleIntervalMs);
+            sentAt = new Date().toISOString();
+            const httpStarted = performance.now();
+            res = await fetch(`${ch.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+              method: "POST",
+              headers: { "content-type": "application/json", authorization: `Bearer ${ch.apiKey}` },
+              body: JSON.stringify(activeBody),
+              signal: AbortSignal.timeout(timeoutMs),
+            });
+            text = await res.text();
+            httpLatencyMs = Math.round(performance.now() - httpStarted);
+            if (res.status === 429 && attempt < 3) {
+              recordThrottleBackoff(activeThrottleKey);
+              const retryAfterMs = Number(res.headers.get("retry-after") || 0) * 1000;
+              const backoffMs = Math.max(retryAfterMs, throttleIntervalMs > 0 ? throttleIntervalMs * (attempt + 1) : 2500 * (attempt + 1));
+              await new Promise((r) => setTimeout(r, backoffMs));
+              continue;
+            }
+            assertAccepted(spec.service, res.status, text);
+            recordChannelSuccess(ch.id);
+            break;
+          } catch (error) {
+            if (attempt < 3 && error instanceof ProviderRejectedError && error.status === 429) {
+              recordThrottleBackoff(activeThrottleKey);
+              const backoffMs = throttleIntervalMs > 0 ? throttleIntervalMs * (attempt + 1) : 2500 * (attempt + 1);
+              await new Promise((r) => setTimeout(r, backoffMs));
+              continue;
+            }
+            recordChannelFailure(ch.id, Date.now(), String(error));
+            const failure = isConnectFailure(error) ? new ProviderRejectedError(`connect failed: ${String(error)}`, null, true) : error;
+            if (circuit) await recordModelHealth(spec.service, permit!, failureKind(failure) !== "refused");
+            throw failure;
+          }
+        }
+      } else {
+        // Multi-channel mode: iterate through currently available channels in priority order.
+        if (shouldPersistState()) await syncChannelStatesFromDb();
+        const nowMs = Date.now();
+        let candidates = channels.filter((ch) => isChannelAvailable(ch.id, nowMs));
+        if (candidates.length === 0) {
+          candidates = channels;
+        }
+
+        let succeeded = false;
+        let lastFailure: unknown;
+
+        for (const ch of candidates) {
+          if (!isChannelAvailable(ch.id, Date.now()) && candidates.some((c) => isChannelAvailable(c.id, Date.now()))) {
             continue;
           }
-          assertAccepted(spec.service, res.status, text);
-          break;
-        } catch (error) {
-          if (attempt < 3 && error instanceof ProviderRejectedError && error.status === 429) {
-            recordThrottleBackoff(throttleKey);
-            const backoffMs = throttleIntervalMs > 0 ? throttleIntervalMs * (attempt + 1) : 2500 * (attempt + 1);
-            await new Promise((r) => setTimeout(r, backoffMs));
-            continue;
+          usedChannel = ch;
+          attemptedChannels.push(ch.id);
+          const activeThrottleKey = `${throttleKey}-${ch.id}`;
+          const activeBody: Record<string, unknown> = {
+            model: ch.model,
+            messages: baseMessages,
+            temperature,
+            max_tokens: maxTokens,
+            ...(spec.jsonMode && opts.json !== false ? { response_format: { type: "json_object" } } : {}),
+            ...(ch.extra ?? {}),
+          };
+          try {
+            await throttleService(activeThrottleKey, throttleIntervalMs);
+            sentAt = new Date().toISOString();
+            const httpStarted = performance.now();
+            res = await fetch(`${ch.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+              method: "POST",
+              headers: { "content-type": "application/json", authorization: `Bearer ${ch.apiKey}` },
+              body: JSON.stringify(activeBody),
+              signal: AbortSignal.timeout(timeoutMs),
+            });
+            text = await res.text();
+            httpLatencyMs = Math.round(performance.now() - httpStarted);
+
+            if (!res.ok) {
+              if (res.status === 429) recordThrottleBackoff(activeThrottleKey);
+              const errSummary = `HTTP ${res.status}: ${text.slice(0, 300)}`;
+              failoverErrors.push({ channelId: ch.id, error: errSummary });
+              const quota = await checkChannelQuotaExhausted(ch, res, text);
+              if (quota.exhausted) {
+                markChannelExhausted(ch.id, quota.untilMs, errSummary);
+              } else {
+                recordChannelFailure(ch.id, Date.now(), errSummary);
+              }
+              assertAccepted(spec.service, res.status, text);
+            }
+
+            // Even on 2xx, check if headers (e.g. TokenHarbor x-th-free-used-pct: 100) indicate quota just hit 100%
+            recordChannelSuccess(ch.id);
+            if (ch.quotaMode === "tokenharbor") {
+              const quota = await checkChannelQuotaExhausted(ch, res, text);
+              if (quota.exhausted) {
+                markChannelExhausted(ch.id, quota.untilMs);
+              }
+            }
+            succeeded = true;
+            break;
+          } catch (error) {
+            // If fetch threw directly (timeout, network error), res is not set or assertAccepted threw ProviderRejectedError
+            if (!(error instanceof ProviderRejectedError)) {
+              const errSummary = (error instanceof Error ? `${error.name}: ${error.message}` : String(error)).slice(0, 300);
+              failoverErrors.push({ channelId: ch.id, error: errSummary });
+              const quota = await checkChannelQuotaExhausted(ch, null, "");
+              if (quota.exhausted) {
+                markChannelExhausted(ch.id, quota.untilMs, errSummary);
+              } else {
+                recordChannelFailure(ch.id, Date.now(), errSummary);
+              }
+            }
+            lastFailure = isConnectFailure(error) ? new ProviderRejectedError(`connect failed: ${String(error)}`, null, true) : error;
           }
-          const failure = isConnectFailure(error) ? new ProviderRejectedError(`connect failed: ${String(error)}`, null, true) : error;
-          // A refusal is the provider answering; any other failure counts against its availability.
-          if (circuit) await recordModelHealth(spec.service, permit!, failureKind(failure) !== "refused");
-          throw failure;
+        }
+
+        if (!succeeded) {
+          if (circuit) await recordModelHealth(spec.service, permit!, failureKind(lastFailure) !== "refused");
+          throw lastFailure;
         }
       }
+
       if (circuit) await recordModelHealth(spec.service, permit!, false);
       let json: Record<string, unknown>;
       try {
@@ -294,7 +747,16 @@ async function chatOnce<S extends z.ZodType>(opts: ChatJsonOptions<S>, circuit =
       }
       const usage = (json.usage as Record<string, unknown> | undefined) ?? null;
       return {
-        response: { ...json, _latencyMs: Math.round(performance.now() - started) },
+        response: {
+          ...json,
+          _sentAt: sentAt,
+          _latencyMs: httpLatencyMs,
+          _channelId: usedChannel.id,
+          _channelIndex: usedChannel.index,
+          _channelModel: usedChannel.model,
+          _attemptedChannels: attemptedChannels,
+          ...(failoverErrors.length > 0 ? { _failoverErrors: failoverErrors } : {}),
+        },
         requestId: (json.id as string | undefined) ?? res.headers.get("x-request-id"),
         usage,
         cost: null,

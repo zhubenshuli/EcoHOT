@@ -22,6 +22,7 @@ process.env.LOG_LEVEL ??= "error";
 // Paid providers are local stubs in these tests: calls and collection may run (the valves default off).
 process.env.MODEL_CALLS_ENABLED ??= "true";
 process.env.COLLECT_ENABLED ??= "true";
+process.env.LLM_RPM ??= "0";
 // The tests were written against named model presets, one per step (each provider is pointed at a
 // local stub by the test that needs it). A step the site leaves on the `default` model gets its
 // preset here; tests/default-model.test.ts covers the default.
@@ -58,8 +59,8 @@ export async function stub(answer: (hit: number, req: { url: string; body: strin
     req.on("end", async () => {
       hits += 1;
       const out = await answer(hits, { url: req.url ?? "/", body: Buffer.concat(chunks).toString("utf8") });
-      const reply = out instanceof Reply ? out : { status: 200, json: out };
-      res.writeHead(reply.status, { "content-type": "application/json" });
+      const reply = out instanceof Reply ? out : { status: 200, json: out, headers: undefined };
+      res.writeHead(reply.status, { "content-type": "application/json", ...(reply.headers ?? {}) });
       res.end(JSON.stringify(reply.json));
     });
   });
@@ -90,9 +91,11 @@ export async function embeddingsStub() {
 export class Reply {
   readonly status: number;
   readonly json: unknown;
-  constructor(status: number, json: unknown) {
+  readonly headers?: Record<string, string>;
+  constructor(status: number, json: unknown, headers?: Record<string, string>) {
     this.status = status;
     this.json = json;
+    this.headers = headers;
   }
 }
 
