@@ -306,18 +306,22 @@
     },
     {
       "id": "json-wscn-global",
-      "name": "华尔街见闻 - 宏观深度与全球市场",
+      "name": "华尔街见闻 - 核心资讯与全球市场",
       "kind": "json_list",
       "config": {
-        "url": "https://api-one.wallstcn.com/apiv1/content/articles?category=global&limit=15",
+        "url": "https://api-one.wallstcn.com/apiv1/content/information-flow?channel=default&limit=15",
         "itemsPath": "data.items",
         "titlePaths": [
+          "resource.title",
+          "resource.content_text",
           "title"
         ],
-        "urlTemplate": "{raw:uri}",
-        "publishedAtPath": "display_time",
+        "urlTemplate": "{raw:resource.uri}",
+        "publishedAtPath": "resource.display_time",
         "publishedAtUnit": "epoch_s",
         "summaryPaths": [
+          "resource.content_text",
+          "resource.content",
           "summary"
         ],
         "_aihot": {
@@ -326,12 +330,12 @@
       },
       "tier": "T1_5",
       "participation_mode": "editorial",
-      "interval_minutes": 60,
+      "interval_minutes": 30,
       "tags": [
-        "宏观",
-        "深度",
-        "全球市场",
-        "研报分析"
+        "核心快讯",
+        "资本市场",
+        "宏观深度",
+        "全球市场"
       ],
       "site_fulltext": false,
       "syndicate_fulltext": false
@@ -470,6 +474,74 @@
         "经济学家",
         "深度分析",
         "全球治理"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "weblist-yicai-news",
+      "name": "第一财经 - 资本市场与产经要闻",
+      "kind": "web_list",
+      "config": {
+        "url": "https://www.yicai.com/",
+        "parseMode": "html",
+        "itemSelector": "a[href^=\"/news/\"]:has(h2)",
+        "linkSelector": "a",
+        "titleSelector": "h2",
+        "publishedAtSelector": ".rightspan span:last-child",
+        "publishedAtUtcOffset": "+08:00",
+        "allowUrlPrefixes": [
+          "https://www.yicai.com/news/"
+        ],
+        "detail": {
+          "publishedAtRegex": "(\\d{4}-\\d{2}-\\d{2}\\s+\\d{2}:\\d{2}:\\d{2})"
+        },
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T1_5",
+      "participation_mode": "editorial",
+      "interval_minutes": 30,
+      "tags": [
+        "资本市场",
+        "A股",
+        "债市",
+        "宏观金融",
+        "公司调查"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "weblist-cs-news",
+      "name": "中证网 - 中国证券报要闻",
+      "kind": "web_list",
+      "config": {
+        "url": "https://www.cs.com.cn/",
+        "parseMode": "html",
+        "itemSelector": "a[href*=\"detail_\"]",
+        "linkSelector": "a",
+        "titleSelector": "a",
+        "allowUrlPrefixes": [
+          "https://www.cs.com.cn/"
+        ],
+        "detail": {
+          "publishedAtSelector": "time"
+        },
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T1_5",
+      "participation_mode": "editorial",
+      "interval_minutes": 30,
+      "tags": [
+        "证券要闻",
+        "资本市场",
+        "A股",
+        "公司财报",
+        "监管动态"
       ],
       "site_fulltext": false,
       "syndicate_fulltext": false
