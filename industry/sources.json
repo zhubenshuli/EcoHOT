@@ -357,6 +357,122 @@
       ],
       "site_fulltext": false,
       "syndicate_fulltext": false
+    },
+    {
+      "id": "weblist-mof-policy",
+      "name": "财政部 - 政策发布",
+      "kind": "web_list",
+      "config": {
+        "url": "http://www.mof.gov.cn/zhengwuxinxi/zhengcefabu/",
+        "parseMode": "html",
+        "itemSelector": ".xwfb_listbox li",
+        "titleSelector": "a",
+        "linkSelector": "a",
+        "publishedAtSelector": "span",
+        "publishedAtUtcOffset": "+08:00",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T1",
+      "participation_mode": "editorial",
+      "interval_minutes": 120,
+      "tags": [
+        "官方",
+        "财政政策",
+        "税收政策",
+        "国债"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "rss-fed-press",
+      "name": "美联储 - 官方新闻与货币政策",
+      "kind": "rss",
+      "config": {
+        "feedUrl": "https://www.federalreserve.gov/feeds/press_all.xml",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T1",
+      "participation_mode": "editorial",
+      "interval_minutes": 60,
+      "tags": [
+        "官方",
+        "美联储",
+        "货币政策",
+        "宏观"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "rss-wsj-economy",
+      "name": "华尔街日报 - 全球经济",
+      "kind": "rss",
+      "config": {
+        "feedUrl": "https://feeds.content.dowjones.io/public/rss/socialeconomyfeed",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T1_5",
+      "participation_mode": "editorial",
+      "interval_minutes": 60,
+      "tags": [
+        "宏观",
+        "全球经济",
+        "央行",
+        "国际经贸"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "rss-mining-news",
+      "name": "Mining.com - 国际矿业与基础金属",
+      "kind": "rss",
+      "config": {
+        "feedUrl": "https://www.mining.com/feed/",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T2",
+      "participation_mode": "editorial",
+      "interval_minutes": 60,
+      "tags": [
+        "大宗商品",
+        "基础金属",
+        "工业资源",
+        "矿产"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "rss-project-syndicate",
+      "name": "Project Syndicate - 全球经济观点",
+      "kind": "rss",
+      "config": {
+        "feedUrl": "https://www.project-syndicate.org/rss",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T2",
+      "participation_mode": "editorial",
+      "interval_minutes": 60,
+      "tags": [
+        "观点",
+        "经济学家",
+        "深度分析",
+        "全球治理"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
     }
   ]
 }
