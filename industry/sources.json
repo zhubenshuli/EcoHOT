@@ -109,7 +109,7 @@
       "name": "MarketWatch - 市场资讯",
       "kind": "rss",
       "config": {
-        "feedUrl": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
+        "feedUrl": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
         "_aihot": {
           "initialBackfillLimit": 8
         }
@@ -129,7 +129,7 @@
       "name": "华尔街日报 - 商业与宏观",
       "kind": "rss",
       "config": {
-        "feedUrl": "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
+        "feedUrl": "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
         "_aihot": {
           "initialBackfillLimit": 8
         }
@@ -149,7 +149,7 @@
       "name": "华尔街日报 - 资本市场",
       "kind": "rss",
       "config": {
-        "feedUrl": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+        "feedUrl": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
         "_aihot": {
           "initialBackfillLimit": 8
         }
@@ -160,29 +160,6 @@
       "tags": [
         "资本市场",
         "证券"
-      ],
-      "site_fulltext": false,
-      "syndicate_fulltext": false
-    },
-    {
-      "id": "json-eastmoney-stock",
-      "name": "东方财富 - 证券聚焦 (A股)",
-      "kind": "json_list",
-      "config": {
-        "url": "https://np-listapi.eastmoney.com/comm/web/getNewsByColumns?client=web&biz=web_news_col&column=353&order=1&needInteractData=0&page_index=1&page_size=20&req_trace=1700000000000&fields=code,showTime,title,mediaName,summary,image,url",
-        "itemsPath": "data.list",
-        "titlePaths": ["title"],
-        "urlTemplate": "{raw:url}",
-        "publishedAtPath": "showTime",
-        "summaryPaths": ["summary"]
-      },
-      "tier": "T1_5",
-      "participation_mode": "editorial",
-      "interval_minutes": 30,
-      "tags": [
-        "A股",
-        "投资",
-        "资本市场"
       ],
       "site_fulltext": false,
       "syndicate_fulltext": false
@@ -204,6 +181,179 @@
         "海外",
         "石油",
         "大宗商品"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "weblist-stats-gov",
+      "name": "国家统计局 - 最新数据发布",
+      "kind": "web_list",
+      "config": {
+        "url": "https://www.stats.gov.cn/sj/zxfb/",
+        "parseMode": "html",
+        "itemSelector": ".list-content ul li",
+        "titleSelector": "a.pc_1600",
+        "linkSelector": "a.pc_1600",
+        "publishedAtSelector": "span",
+        "publishedAtUtcOffset": "+08:00",
+        "allowUrlPrefixes": [
+          "https://www.stats.gov.cn/sj/zxfb/"
+        ],
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T1",
+      "participation_mode": "editorial",
+      "interval_minutes": 60,
+      "tags": [
+        "官方",
+        "宏观",
+        "统计数据"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "weblist-pbc-gov",
+      "name": "中国人民银行 - 货币政策与动态",
+      "kind": "web_list",
+      "config": {
+        "url": "https://www.pbc.gov.cn/goutongjiaoliu/113456/113469/index.html",
+        "parseMode": "html",
+        "itemSelector": "tr:has(font.newslist_style a)",
+        "titleSelector": "font.newslist_style a",
+        "linkSelector": "font.newslist_style a",
+        "publishedAtSelector": "span.hui12",
+        "publishedAtUtcOffset": "+08:00",
+        "allowUrlPrefixes": [
+          "https://www.pbc.gov.cn/goutongjiaoliu/113456/113469/"
+        ],
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T1",
+      "participation_mode": "editorial",
+      "interval_minutes": 60,
+      "tags": [
+        "官方",
+        "央行",
+        "货币政策",
+        "金融"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "json-gov-policy",
+      "name": "中国政府网 - 国务院最新政策",
+      "kind": "json_list",
+      "config": {
+        "url": "https://www.gov.cn/zhengce/zuixin/ZUIXINZHENGCE.json",
+        "itemsPath": "",
+        "titlePaths": [
+          "TITLE"
+        ],
+        "urlTemplate": "{raw:URL}",
+        "publishedAtPath": "DOCRELPUBTIME",
+        "publishedAtUtcOffset": "+08:00",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T1",
+      "participation_mode": "editorial",
+      "interval_minutes": 120,
+      "tags": [
+        "官方",
+        "政策法规",
+        "宏观"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "weblist-ndrc-gov",
+      "name": "国家发改委 - 宏观调控与发布",
+      "kind": "web_list",
+      "config": {
+        "url": "https://www.ndrc.gov.cn/xwdt/",
+        "parseMode": "html",
+        "itemSelector": ".u-list li",
+        "titleSelector": "a",
+        "linkSelector": "a",
+        "publishedAtSelector": "span",
+        "publishedAtUtcOffset": "+08:00",
+        "allowUrlPrefixes": [
+          "https://www.ndrc.gov.cn/xwdt/"
+        ],
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T1",
+      "participation_mode": "editorial",
+      "interval_minutes": 120,
+      "tags": [
+        "官方",
+        "宏观调控",
+        "产业政策"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "json-wscn-global",
+      "name": "华尔街见闻 - 宏观深度与全球市场",
+      "kind": "json_list",
+      "config": {
+        "url": "https://api-one.wallstcn.com/apiv1/content/articles?category=global&limit=15",
+        "itemsPath": "data.items",
+        "titlePaths": [
+          "title"
+        ],
+        "urlTemplate": "{raw:uri}",
+        "publishedAtPath": "display_time",
+        "publishedAtUnit": "epoch_s",
+        "summaryPaths": [
+          "summary"
+        ],
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T1_5",
+      "participation_mode": "editorial",
+      "interval_minutes": 60,
+      "tags": [
+        "宏观",
+        "深度",
+        "全球市场",
+        "研报分析"
+      ],
+      "site_fulltext": false,
+      "syndicate_fulltext": false
+    },
+    {
+      "id": "rss-eeo-news",
+      "name": "经济观察网 - 产经与宏观调查",
+      "kind": "rss",
+      "config": {
+        "feedUrl": "http://www.eeo.com.cn/rss.xml",
+        "_aihot": {
+          "initialBackfillLimit": 8
+        }
+      },
+      "tier": "T2",
+      "participation_mode": "editorial",
+      "interval_minutes": 60,
+      "tags": [
+        "商业",
+        "宏观",
+        "深度",
+        "产业动态"
       ],
       "site_fulltext": false,
       "syndicate_fulltext": false
