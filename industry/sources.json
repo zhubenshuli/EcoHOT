@@ -485,9 +485,9 @@
       "config": {
         "url": "https://www.yicai.com/",
         "parseMode": "html",
-        "itemSelector": "a[href^=\"/news/\"]:has(h2)",
+        "itemSelector": ".m-box a[href^=\"/news/\"], .m-scrollcontent .m-con:first-child a[href^=\"/news/\"]:has(h2)",
         "linkSelector": "a",
-        "titleSelector": "h2",
+        "titleSelector": "h2, h3",
         "publishedAtSelector": ".rightspan span:last-child",
         "publishedAtUtcOffset": "+08:00",
         "allowUrlPrefixes": [
@@ -502,7 +502,7 @@
       },
       "tier": "T1_5",
       "participation_mode": "editorial",
-      "interval_minutes": 30,
+      "interval_minutes": 60,
       "tags": [
         "资本市场",
         "A股",
